@@ -22,6 +22,8 @@ depositfiles    | download | upload | delete | list | probe |
 directmirror    |          | upload |        | list |       |
 divshare        | download | upload | delete | list | probe |
 dl_free_fr      | download | upload | delete |      | probe |
+ddownload       |          | upload |        |      |       |
+doodstream      |          | upload |        |      |       |
 embedupload     |          |        |        | list |       |
 espafiles       | download |        |        |      | probe |
 euroshare_eu    | download | upload | delete |      | probe |
@@ -35,6 +37,7 @@ filedais        | download |        |        |      | probe |
 filefactory     | download | upload |        | list | probe |
 filejoker       | download |        |        |      | probe |
 filemonkey      |          | upload |        |      |       |
+filemoon        |          | upload |        |      |       |
 fileover        | download |        |        |      | probe |
 fileparadox     |          | upload |        |      |       |
 filepost        | download | upload | delete | list | probe |
@@ -91,6 +94,7 @@ sharehost       | download |        |        |      | probe |
 shareonline_biz | download | upload |        |      | probe |
 sockshare       | download | upload | delete | list | probe |
 solidfiles      | download | upload |        | list | probe |
+streamsb        |          | upload |        |      |       |
 tempsend        | download | upload |        |      | probe |
 tempshare       | download |        |        |      | probe |
 tezfiles        | download |        |        |      | probe |
