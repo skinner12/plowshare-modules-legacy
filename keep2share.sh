@@ -396,7 +396,7 @@ keep2share_download() {
 keep2share_upload() {
     local -r FILE=$2
     local -r DEST_FILE=$3
-    local -r API_URL='http://keep2share.cc/api/v1/'
+    local -r API_URL='http://keep2share.cc/api/v2/'
     local AT ACCOUNT MAX_SIZE SZ TOKEN JSON JSON2 FILE_ID FOLDER_ID
 
     if [ -n "$AUTH" ]; then
@@ -415,7 +415,7 @@ keep2share_upload() {
     if [ "$ACCOUNT" = 'premium' ]; then
         MAX_SIZE=5368709120 # 5 GiB (premium account)
     else
-        MAX_SIZE=524288000 # 500 MiB (free account)
+        MAX_SIZE=5368709120 # 5 GiB (free account)
     fi
 
     SZ=$(get_filesize "$FILE")
@@ -475,22 +475,26 @@ keep2share_upload() {
     FORM_ACTION=$(parse_json 'form_action' <<< "$JSON" ) || return
     FILE_FIELD=$(parse_json 'file_field' <<< "$JSON" ) || return
 
-    JSON2=$(parse_json 'form_data' <<< "$JSON" ) || return
-    log_debug "json2: '$JSON2'"
+    AJAX=$(parse_json 'ajax' <<< "$JSON" ) || return
+    SIGNATURE=$(parse_json 'signature' <<< "$JSON" ) || return
+    PARAMS=$(parse_json 'params' <<< "$JSON" ) || return
 
-    NODE_NAME=$(parse_json 'nodeName' <<< "$JSON2" ) || return
-    USER_ID=$(parse_json 'userId' <<< "$JSON2" ) || return
-    HMAC=$(parse_json 'hmac' <<< "$JSON2" ) || return
-    EXPIRES=$(parse_json 'expires' <<< "$JSON2" ) || return
+    #JSON2=$(parse_json 'form_data' <<< "$JSON" ) || return
+    #log_debug "json2: '$JSON2'"
 
+    #NODE_NAME=$(parse_json 'nodeName' <<< "$JSON2" ) || return
+    #USER_ID=$(parse_json 'userId' <<< "$JSON2" ) || return
+    #HMAC=$(parse_json 'hmac' <<< "$JSON2" ) || return
+    #EXPIRES=$(parse_json 'expires' <<< "$JSON2" ) || return
+
+
+    # curl -F "$FileField=@$FullFileName" -F "ajax=$Ajax" -F "signature=$Sig" -F "params=$Params" "$Form_Action"
     [ -z "$FOLDER_ID" ] || FOLDER_ID="-F parent_id=$FOLDER_ID"
     JSON=$(curl_with_log \
         -F "$FILE_FIELD=@$FILE;filename=$DEST_FILE" \
-        -F "nodeName=$NODE_NAME" \
-        -F "userId=$USER_ID" \
-        -F "hmac=$HMAC" \
-        -F "expires=$EXPIRES" \
-        -F 'api_request=true' \
+        -F "ajax=$NODE_NAME" \
+        -F "signature=$SIGNATURE" \
+        -F "params=$PARAMS" \
         $FOLDER_ID "$FORM_ACTION") || return
 
     # Sanity check
@@ -500,12 +504,13 @@ keep2share_upload() {
         return $ERR_LINK_TEMP_UNAVAILABLE
     fi
 
-    # {"user_file_id":"3ef8d474ad919","status":"success","status_code":200}
+    #{"status": "success", "success": true, "status_code": 200, "user_file_id": "2fb61a7851ac2", "link": "https://k2s.cc/file/2fb61a7851ac2"}
     keep2share_status "$JSON" || return
 
     FILE_ID=$(parse_json 'user_file_id' <<< "$JSON" ) || return
+    LINK_UPLOADED_FILE=$(parse_json 'link' <<< "$JSON" ) || return
     if [ -z "$FULL_LINK" ]; then
-        echo "http://k2s.cc/file/$FILE_ID"
+        echo $LINK_UPLOADED_FILE
     else
         echo "http://k2s.cc/file/$FILE_ID/$DEST_FILE"
     fi
