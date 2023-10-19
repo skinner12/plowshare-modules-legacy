@@ -6,7 +6,7 @@
 mkdir -p ~/.config/plowshare/modules.d
 cd ~/.config/plowshare/modules.d
 git clone git@github.com:skinner12/plowshare-modules-legacy.git
-mv plowshare-modules-legacy-master legacy
+mv plowshare-modules-legacy legacy
 
 ```
 
