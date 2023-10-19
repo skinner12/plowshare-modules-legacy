@@ -73,6 +73,7 @@ myvdrive        | download | upload |        | list | probe |
 nakido          | download |        |        |      | probe |
 netkups         | download | upload |        |      | probe |
 netload_in      | download | upload |        | list | probe |
+netu            |          | upload |        |      |       |
 nippyspace      |          | upload |        |      | probe |
 nitroflare      | download |        |        |      | probe |
 nowdownload_co  | download | upload |        |      | probe |
@@ -113,6 +114,7 @@ uptobox         | download | upload |        |      | probe |
 videowood_tv    |          | upload |        |      |       |
 vidzi_tv        |          | upload |        |      |       |
 vid_ag          |          | upload |        |      |       |
+voe             |          | upload |        |      |       |
 yolobit_com     | download |        |        |      |       |
 yourvideohost   | download |        |        |      | probe |
 zalaa           | download | upload |        | list | probe |
