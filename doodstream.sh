@@ -31,7 +31,7 @@ MODULE_DOODSTREAM_UPLOAD_REMOTE_SUPPORT=no
 
 doodstream_upload() {
   local -r FILE=$2
-  local -r API_URL='https://doodapi.com/api'
+  local -r API_URL='https://doodapi.co/api'
   local SZ TOKEN JSON JSON2 EMAIL
 
   if [ -z "$AUTH" ]; then
