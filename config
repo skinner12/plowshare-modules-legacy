@@ -67,6 +67,7 @@ mediafire       | download | upload |        | list | probe |
 megashares      | download | upload | delete |      | probe |
 mirrorcreator   |          | upload |        | list |       |
 mirrorupload    |          | upload |        | list |       |
+mixdrop         |          | upload |        |      |       |
 multiup_org     |          | upload |        | list | probe |
 multiupload     | download | upload |        | list |       |
 myvdrive        | download | upload |        | list | probe |
