@@ -76,7 +76,7 @@ netkups         | download | upload |        |      | probe |
 netload_in      | download | upload |        | list | probe |
 netu            |          | upload |        |      |       |
 nippyspace      |          | upload |        |      | probe |
-nitroflare      | download |        |        |      | probe |
+nitroflare      | download | upload |        |      | probe |
 nowdownload_co  | download | upload |        |      | probe |
 oboom           | download | upload |        | list | probe |
 openload        | download | upload |        |      | probe |
