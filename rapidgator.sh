@@ -1,5 +1,7 @@
-# Plowshare rapidgator.net module
-# Copyright (c) 2012-2014 Plowshare team
+#!/bin/bash
+#
+# rapidgator.sh - Rapidgator upload module for plowshare
+# Copyright (c) 2024 Plowshare team
 #
 # This file is part of Plowshare.
 #
@@ -18,451 +20,66 @@
 
 MODULE_RAPIDGATOR_REGEXP_URL='https\?://\(www\.\)\?rapidgator\.net/'
 
-MODULE_RAPIDGATOR_DOWNLOAD_OPTIONS="
-AUTH,a,auth,a=EMAIL:PASSWORD,User account"
-MODULE_RAPIDGATOR_DOWNLOAD_RESUME=yes
-MODULE_RAPIDGATOR_DOWNLOAD_FINAL_LINK_NEEDS_COOKIE=no
-MODULE_RAPIDGATOR_DOWNLOAD_SUCCESSIVE_INTERVAL=2100
-
 MODULE_RAPIDGATOR_UPLOAD_OPTIONS="
-AUTH,a,auth,a=EMAIL:PASSWORD,User account
-FOLDER,,folder,s=FOLDER,Folder to upload files into (account only)
-ASYNC,,async,,Asynchronous remote upload (only start upload, don't wait for link)
-CLEAR,,clear,,Clear list of remote uploads"
-MODULE_RAPIDGATOR_UPLOAD_REMOTE_SUPPORT=yes
-
-MODULE_RAPIDGATOR_LIST_OPTIONS=""
-MODULE_RAPIDGATOR_LIST_HAS_SUBFOLDERS=no
-
-MODULE_RAPIDGATOR_DELETE_OPTIONS="
-AUTH,a,auth,a=EMAIL:PASSWORD,User account"
+AUTH,a,auth,a=USER:PASSWORD,User account
+FOLDER,,folder,s=FOLDER_ID,Folder ID to upload files to
+DESCRIPTION,d,description,S=DESCRIPTION,Set file description
+TWOFA,,2fa,s=CODE,Two-factor authentication code
+ASYNC,,async,,Asynchronous remote upload
+"
+MODULE_RAPIDGATOR_UPLOAD_REMOTE_SUPPORT=no
 MODULE_RAPIDGATOR_PROBE_OPTIONS=""
 
-# Static function. Proceed with login (free)
+# Static function. Proceed with login
 # $1: authentication
 # $2: cookie file
-# $3: base url
-# stdout: account type ("free" or "premium") on success
+# $3: base URL
+# $4: 2FA code (optional)
 rapidgator_login() {
     local -r AUTH=$1
     local -r COOKIE_FILE=$2
     local -r BASE_URL=$3
-    local LOGIN_DATA HTML EMAIL TYPE STATUS
+    local -r TWOFA_CODE=$4
+    local JSON TOKEN USERNAME PASSWORD LOGIN_URL
 
-    LOGIN_DATA='LoginForm[email]=$USER&LoginForm[password]=$PASSWORD&LoginForm[rememberMe]=1&g-recaptcha-response='
-    HTML=$(post_login "$AUTH" "$COOKIE_FILE" "$LOGIN_DATA" \
-        "$BASE_URL/auth/login" -L -b "$COOKIE_FILE" -H "Referer: https://rapidgator.net/auth/login") || return
+    log_debug "Rapidgator: attempting login"
+    
+    split_auth "$AUTH" USERNAME PASSWORD || return
+    
+    # URL encode credentials
+    USERNAME=$(uri_encode_strict <<< "$USERNAME")
+    PASSWORD=$(uri_encode_strict <<< "$PASSWORD")
+    
+    # Build login URL
+    LOGIN_URL="$BASE_URL/api/v2/user/login?login=$USERNAME&password=$PASSWORD"
+    
+    # Add 2FA code if provided
+    if [ -n "$TWOFA_CODE" ]; then
+        LOGIN_URL="${LOGIN_URL}&code=$TWOFA_CODE"
+        log_debug "Using 2FA code"
+    fi
+    
+    # Login request with parameters in URL
+    JSON=$(curl -s --fail "$LOGIN_URL") || return
 
-    # Check for JS redirection
-    # <script language="JavaScript">function ZD5wC ... window.location.href='/auth/login?'+MGOwqz+'';MGOwqz='';</script>
-    if match 'window.location.href=' "$HTML"; then
-        log_debug 'JS redirect detected'
-        local JS_CODE REDIR
+    log_debug "Login response: $JSON"
 
-        detect_javascript || return
-        JS_CODE=$(parse . '<script language="JavaScript">\(.\+\)</script>' <<< "$HTML") || return
-        REDIR=$(javascript <<< "var window={};window.location={}; $JS_CODE print(window.location.href);") || return
-        HTML=$(curl -L -b "$COOKIE_FILE" -c "$COOKIE_FILE" "$BASE_URL$REDIR") || return
+    # Check for 2FA requirement
+    if match '"status":401' "$JSON" && match 'code is required' "$JSON"; then
+        log_error "Two-factor authentication required. Use --2fa=CODE option"
+        return $ERR_LOGIN_FAILED
     fi
 
-    STATUS=$(parse_cookie_quiet 'user__' < "$COOKIE_FILE")
-
-    # Check for some heavy usage login problems
-    if [ -z "$STATUS" ]; then
-        # Forced wait
-        # <li>Frequent logins. Please wait 20 sec...</li>
-        if match 'Frequent logins' "$HTML"; then
-            log_debug 'Login detention detected'
-            local WAIT_TIME
-
-            WAIT_TIME=$(parse 'Frequent logins' \
-                'Please wait \([[:digit:]]\+\) sec' <<< "$HTML") || return
-            wait $WAIT_TIME || return
-
-            # Retry login
-            HTML=$(post_login "$AUTH" "$COOKIE_FILE" "$LOGIN_DATA" \
-                "$BASE_URL/auth/login" -L -b "$COOKIE_FILE") || return
-
-        # CAPTCHA
-        # <li>The code from a picture does not coincide</li>
-        elif match 'The code from a picture does not coincide' "$HTML"; then
-            log_debug 'Login CAPTCHA detected'
-            local CAPTCHA_URL IMG_FILE WI WORD ID
-
-            IMG_FILE=$(create_tempfile '.rapidgator.jpg') || return
-
-            # Get captcha image
-            CAPTCHA_URL=$(parse_attr 'auth/captcha' 'src' <<< "$HTML") || return
-            curl -b "$COOKIE_FILE" -o "$IMG_FILE" "${BASE_URL}${CAPTCHA_URL}" || return
-
-            # Solve captcha
-            # Note: Image is a 120x50 png file containing 5 characters
-            WI=$(captcha_process "$IMG_FILE" rapidgator 5 5) || return
-            { read WORD; read ID; } <<< "$WI"
-            rm -f "$IMG_FILE"
-
-            # Retry login with CAPTCHA
-            HTML=$(post_login "$AUTH" "$COOKIE_FILE" "${LOGIN_DATA}&LoginForm[verifyCode]=$WORD" \
-            "$BASE_URL/auth/login" -L -b "$COOKIE_FILE") || return
-
-            if match 'The code from a picture does not coincide' "$HTML"; then
-                captcha_nack "$ID"
-                return $ERR_CAPTCHA
-            fi
-
-            captcha_ack "$ID"
-
-        else
-            # emulate 'grep_form_by_id_quiet'
-            local FORM=$(grep_form_by_id "$HTML" 'registration' 2>/dev/null)
-            log_debug "Unexpected login issue: $FORM"
-            return $ERR_FATAL
-        fi
-    fi
-
-    STATUS=$(parse_cookie_quiet 'user__' < "$COOKIE_FILE")
-
-    if [ -z "$STATUS" ]; then
-        if match 'Error e-mail or password' "$HTML"; then
-            return $ERR_LOGIN_FAILED
-        fi
-
-        log_error 'Unexpected content. Site updated?'
-        return $ERR_FATAL
-    fi
-
-    split_auth "$AUTH" EMAIL || return
-
-    if match '^[[:space:]]*Account:.*Free' "$HTML"; then
-        TYPE='free'
-    elif match "^[[:space:]]*Premium.*$EMAIL" "$HTML"; then
-        TYPE='premium'
-    else
-        log_error 'Could not determine account type. Site updated?'
-        return $ERR_FATAL
-    fi
-    log_debug "Successfully logged in as $TYPE member '$EMAIL'"
-
-    echo "$TYPE"
-}
-
-# Switch language to english
-# $1: cookie file
-# $2: base URL
-rapidgator_switch_lang() {
-    rapidgator_redir_curl "$2/site/lang" -b "$1" -c "$1" -d 'lang=en' > /dev/null || return
-}
-
-# Check if specified folder name is valid.
-# When multiple folders wear the same name, first one is taken.
-# $1: source code of main page
-# $2: folder name selected by user
-# stdout: folder ID
-rapidgator_check_folder() {
-    local -r HTML=$1
-    local -r NAME=$2
-    local FOLDERS FOL FOL_ID
-
-    # Special treatment for root folder (alsways uses ID "0")
-    if [ "$NAME" = 'root' ]; then
-        echo 0
+    # Check for errors
+    if match '"status":200' "$JSON"; then
+        TOKEN=$(parse_json 'token' <<< "$JSON") || return
+        log_debug "Login successful, token: $TOKEN"
+        echo "$TOKEN"
         return 0
-    fi
-
-    # <option value="ID">NAME</option>
-    FOLDERS=$(parse_all_tag option <<< "$HTML") || return
-    if [ -z "$FOLDERS" ]; then
-        log_error 'No folder found, site updated?'
-        return $ERR_FATAL
-    fi
-
-    log_debug 'Available folders:' $FOLDERS
-
-    while IFS= read -r FOL; do
-        if [ "$FOL" = "$NAME" ]; then
-            FOL_ID=$(parse_attr "^<option.*>$FOL</option>" 'value' <<< "$HTML") || return
-            echo "$FOL_ID"
-            return 0
-        fi
-    done <<< "$FOLDERS"
-
-    log_error "Invalid folder, choose from:" $FOLDERS
-    return $ERR_BAD_COMMAND_LINE
-}
-
-# Get number of active remote uploads for an Rapidgator account
-# $1: cookie file (logged into account)
-# $2: base url
-# stdout: number of active remote downloads
-rapidgator_num_remote() {
-    local TRY
-
-    for TRY in 1 2 3; do
-        curl -b "$1" -H 'X-Requested-With: XMLHttpRequest' \
-            "$2/remotedl/RefreshCountDiv?_=$(date +%s)000" && return
-
-        log_debug "Site did not answer. Retrying... [$TRY]"
-        wait 30 || return
-    done
-
-    return $ERR_FATAL
-}
-
-# Check for and handle redirection loop that may occur on first request to site
-# $1: URL
-# $2..$n other are curl arguments
-# stdout: full content of actual page
-rapidgator_redir_curl() {
-    local -r URL=$1
-    shift
-    local PAGE REDIR
-
-    PAGE=$(curl --include $@ "$URL") || return
-    REDIR=$(grep_http_header_location_quiet <<< "$PAGE")
-
-    #/...?DyMyf276e3c54722ffe7b5128d6226fc6cd7=0024a0cee4ae8127d55c0efe0ef2e4e2
-    if [ -n "$REDIR" ] && match '/.*?[[:alnum:]]\+=[[:alnum:]]\+$' "$REDIR"; then
-        log_debug 'Redirection loop...'
-        curl $@ "$BASE_URL$REDIR" || return
     else
-        echo "$PAGE"
+        log_error "Login failed: $JSON"
+        return $ERR_LOGIN_FAILED
     fi
-}
-
-
-# Output a file URL to download from Rapidgator
-# $1: cookie file
-# $2: rapidgator url
-# stdout: real file download link
-#         file name
-rapidgator_download() {
-    local -r COOKIE_FILE=$1
-    local -r URL=${2/#http:/https:}
-    local -r BASE_URL='https://rapidgator.net'
-    local -r CAPTCHA_URL='/download/captcha'
-    local ACCOUNT HTML REDIR FILE_ID FILE_NAME SESSION_ID JSON STATE
-    local WAIT_TIME FORM RESP CHALL CAPTCHA_DATA ID
-
-    rapidgator_switch_lang "$COOKIE_FILE" "$BASE_URL" || return
-
-    if [ -n "$AUTH" ]; then
-        ACCOUNT=$(rapidgator_login "$AUTH" "$COOKIE_FILE" \
-            "$BASE_URL") || return
-    fi
-
-    # Also log headers to capture premium 'direct download' link
-    HTML=$(curl --include -b "$COOKIE_FILE" -c "$COOKIE_FILE" "$URL") || return
-    REDIR=$(grep_http_header_location_quiet <<< "$HTML")
-
-    # Various (temporary) errors
-    if [ -z "$HTML" ] || match '502 Bad Gateway' "$HTML" || \
-        match 'Error 500' "$HTML"; then
-        log_error 'Remote server error, maybe due to overload.'
-        echo 120 # arbitrary time
-        return $ERR_LINK_TEMP_UNAVAILABLE
-
-    # Various "File not found" responses
-    elif match 'Error 404' "$HTML" || \
-        match 'File not found' "$HTML" ||
-        [[ "$REDIR" = */article/premium ]]; then
-        return $ERR_LINK_DEAD
-    fi
-
-    # [premium] You have reached daily quota of downloaded information for premium accounts. At the moment, the quota is 15 GB
-    # [free, anon] You have reached your daily downloads limit. Please try again later.
-    if match 'You have reached.*daily.*\(quota\|limit\)' "$HTML"; then
-        # We'll take it literally and wait till the next day
-        # Note: Consider the time zone of their server (+4:00)
-        local HOUR MIN TIME
-
-        # Get current UTC time, prevent leading zeros
-        TIME=$(date -u +'%k:%M') || return
-        HOUR=${TIME%:*}
-        MIN=${TIME#*:}
-
-        log_error 'Daily limit reached.'
-        echo $(( ((23 - ((HOUR + 4) % 24) ) * 60 + (61 - ${MIN#0}) ) * 60 ))
-        return $ERR_LINK_TEMP_UNAVAILABLE
-    fi
-
-    # Try to parse file name from page title
-    FILE_NAME=$(parse_tag_quiet 'title' <<< "$HTML")
-    FILE_NAME=${FILE_NAME#Download file }
-
-    # If this is a premium download, we already have the download link
-    if [ "$ACCOUNT" = 'premium' ]; then
-        MODULE_RAPIDGATOR_DOWNLOAD_SUCCESSIVE_INTERVAL=0
-        
-        # Consider errors (enforced limits) which only occur for premium users
-        # You have reached quota of downloaded information for premium accounts
-        if match 'reached quota of downloaded information' "$HTML"; then
-            log_error 'Quota exceeded.'
-            echo 3600
-            return $ERR_LINK_TEMP_UNAVAILABLE
-        fi
-
-        # Extract premium download link from page
-        if match 'Click here to download' "$HTML"; then
-            parse 'premium_download_link' "'\(.\+\)'" <<< "$HTML" || return
-            echo "$FILE_NAME"
-            return 0
-        fi
-
-        # This may be a 'direct download'
-        if [ -z "$REDIR" ]; then
-            log_error 'Unexpected content. Site updated?'
-            return $ERR_FATAL
-        fi
-
-        HTML=$(curl --head "$REDIR") || return
-
-        # Parse and output file name
-        echo "$REDIR"
-        grep_http_header_content_disposition <<< "$HTML" || return
-        return 0
-    fi
-
-    # Consider errors (enforced limits) which only occur for free users
-    # You have reached your hourly downloads limit. Please, try again later.
-    if match 'reached your hourly downloads limit' "$HTML"; then
-        log_error 'Hourly limit reached.'
-        echo 3600
-        return $ERR_LINK_TEMP_UNAVAILABLE
-
-    # You can`t download not more than 1 file at a time in free mode.
-    elif match 'download not more than .\+ in free mode' "$HTML"; then
-        log_error 'No parallel download allowed.'
-        echo 120 # wait some arbitrary time
-        return $ERR_LINK_TEMP_UNAVAILABLE
-
-    # You can download files up to 500 MB in free mode.
-    # This file can be downloaded by premium only
-    # Note: The regexp would also match the "parallel download" error above.
-    elif match 'can.*download.*\(in free mode\|premium only\)' "$HTML"; then
-        return $ERR_LINK_NEED_PERMISSIONS
-
-    # Delay between downloads must be not less than 15 min.
-    # Note: We cannot just look for the text by itself because it is
-    #       always present as parts of the page's javascript code.
-    elif match '^[[:space:]]\+Delay between downloads' "$HTML"; then
-        WAIT_TIME=$(parse 'Delay between downloads' \
-            'not less than \([[:digit:]]\+\) min' <<< "$HTML") || return
-
-        log_error 'Forced delay between downloads.'
-        echo $(( WAIT_TIME * 60 ))
-        return $ERR_LINK_TEMP_UNAVAILABLE
-    fi
-
-    # Extract file ID
-    FILE_ID=$(parse 'var fid' '=[[:space:]]\+\([[:digit:]]\+\)' <<< "$HTML") || return
-    log_debug "File ID: $FILE_ID"
-
-    # Parse wait time from page
-    WAIT_TIME=$(parse 'var secs' '=[[:space:]]\+\([[:digit:]]\+\)' <<< "$HTML") || return
-
-    # Request download session
-    JSON=$(curl -b "$COOKIE_FILE" --referer "$URL" \
-        -H 'X-Requested-With: XMLHttpRequest' \
-        -H 'Accept: application/json, text/javascript, */*; q=0.01' \
-        "$BASE_URL/download/AjaxStartTimer?fid=$FILE_ID") || return
-
-    # Check status
-    # Note: from '$(".btn-free").click(function(){...'
-    STATE=$(parse_json 'state' <<< "$JSON") || return
-
-    if [ "$STATE" = 'started' ]; then
-        SESSION_ID=$(parse_json 'sid' <<< "$JSON") || return
-    elif [ "$STATE" = 'error' ]; then
-        log_error "Remote error: $(parse_json 'code' <<< "$JSON")"
-        return $ERR_FATAL
-    else
-        log_error 'Unexpected state. Site updated?'
-    fi
-
-    log_debug "Session ID: '$SESSION_ID'"
-    wait $WAIT_TIME seconds || return
-
-    # Request download
-    # Note: We *must* keep the new cookie.
-    JSON=$(curl -b "$COOKIE_FILE" -c "$COOKIE_FILE" --referer "$URL" \
-        -H 'X-Requested-With: XMLHttpRequest' \
-        -H 'Accept: application/json, text/javascript, */*; q=0.01' \
-        "$BASE_URL/download/AjaxGetDownloadLink?sid=$SESSION_ID") || return
-
-    # Check status
-    # Note: from 'function getDownloadLink() {...'
-    STATE=$(parse_json 'state' <<< "$JSON") || return
-
-    if [ "$STATE" = 'error' ]; then
-        log_error "Remote error: $(parse_json 'code' <<< "$JSON")"
-        return $ERR_FATAL
-    elif [ "$STATE" != 'done' ]; then
-        log_error 'Unexpected state. Site updated?'
-        return $ERR_FATAL
-    fi
-
-    # Get main captcha page
-    # Note: site uses multiple captcha services :-(
-    HTML=$(curl -i -b "$COOKIE_FILE" --referer "$URL" \
-        "$BASE_URL$CAPTCHA_URL") || return
-
-    # Check HTTP response codes
-    if match '^HTTP.*\(302\|500\)' "$HTML"; then
-        log_error 'Captcha server overloaded.'
-        echo 15 # wait some arbitrary time
-        return $ERR_LINK_TEMP_UNAVAILABLE
-    fi
-
-    # emulate 'grep_form_by_id_quiet'
-    FORM=$(grep_form_by_id "$HTML" 'captchaform' 2>/dev/null)
-
-    # Solve each type of captcha separately
-    if [ -n "$FORM" ]; then
-        if match 'api\(-secure\)\?\.solvemedia' "$FORM"; then
-            log_debug 'Solve Media CAPTCHA found'
-
-            RESP=$(solvemedia_captcha_process 'oy3wKTaFP368dkJiGUqOVjBR2rOOR7GR') || return
-            { read CHALL; read ID; } <<< "$RESP"
-
-            CAPTCHA_DATA="-d adcopy_challenge=$(uri_encode_strict <<< "$CHALL") -d adcopy_response=manual_challenge"
-
-        else
-            log_error "Unexpected content/captcha type: '$FORM'"
-            return $ERR_FATAL
-        fi
-
-        log_debug "Captcha data: $CAPTCHA_DATA"
-
-        # Get download link (Note: No quotes around $CAPTCHA_DATA!)
-        HTML=$(curl -b "$COOKIE_FILE" -c "$COOKIE_FILE" \
-            --referer "$BASE_URL$CAPTCHA_URL" \
-            -d 'DownloadCaptchaForm%5Bcaptcha%5D=' \
-            $CAPTCHA_DATA \
-            "$BASE_URL$CAPTCHA_URL") || return
-
-        if ! match 'Click here to download' "$HTML"; then
-            local FAIL_COOKIE
-            FAIL_COOKIE=$(parse_cookie_quiet 'failed_on_captcha' < "$COOKIE_FILE")
-            log_debug "fail cookie: '$FAIL_COOKIE'"
-
-            if match 'verification code is incorrect' "$HTML" || \
-                [ "$FAIL_COOKIE" = '1' ]; then
-                captcha_nack $ID
-                log_debug 'Wrong captcha'
-                return $ERR_CAPTCHA
-            fi
-
-            log_error 'Unexpected content. Site updated?'
-            return $ERR_FATAL
-        fi
-
-        captcha_ack $ID
-        log_debug 'Correct captcha'
-    fi
-
-    # Extract + output download link
-    parse 'function getUrl' "'\(.\+\)'" 2  <<< "$HTML" || return
-    echo "$FILE_NAME"
 }
 
 # Upload a file to Rapidgator
@@ -470,315 +87,191 @@ rapidgator_download() {
 # $2: input file (with full path)
 # $3: remote filename
 # stdout: download link
-#         delete link
 rapidgator_upload() {
     local -r COOKIE_FILE=$1
     local -r FILE=$2
-    local -r DEST_FILE=$3
+    local -r DESTFILE=$3
     local -r BASE_URL='https://rapidgator.net'
-    local HTML URL LINK DEL_LINK
+    local TOKEN UPLOAD_DATA JSON UPLOAD_URL UPLOAD_ID STATE
+    local FILE_SIZE FILE_HASH DOWNLOAD_URL
 
-    # Sanity checks
-    [ -n "$AUTH" ] || return $ERR_LINK_NEED_PERMISSIONS
-
-    if [ -n "$FOLDER" ] && match_remote_url "$FILE"; then
-        log_error 'Folder selection only available for local uploads.'
-        return $ERR_BAD_COMMAND_LINE
-
-    elif [ -n "$ASYNC" ] && ! match_remote_url "$FILE"; then
-        log_error 'Cannot upload local files asynchronously.'
-        return $ERR_BAD_COMMAND_LINE
-
-    elif [ -n "$ASYNC" -a "$DEST_FILE" != 'dummy' ]; then
-        log_error 'Cannot rename a file uploaded asynchronously.'
-        return $ERR_BAD_COMMAND_LINE
+    # Module requires authentication
+    if [ -z "$AUTH" ]; then
+        log_error "Rapidgator: authentication required"
+        return $ERR_LINK_NEED_PERMISSIONS
     fi
 
-    rapidgator_switch_lang "$COOKIE_FILE" "$BASE_URL" || return
+    # Login and get token
+    TOKEN=$(rapidgator_login "$AUTH" "$COOKIE_FILE" "$BASE_URL" "$TWOFA") || return
+    
+    # Get file size
+    FILE_SIZE=$(get_filesize "$FILE") || return
+    log_debug "File size: $FILE_SIZE bytes"
+    
+    # Calculate MD5 hash
+    log_debug "Calculating MD5 hash..."
+    FILE_HASH=$(md5sum "$FILE" | cut -d' ' -f1) || return
+    log_debug "File hash: $FILE_HASH"
 
-    # Login (don't care for account type)
-    rapidgator_login "$AUTH" "$COOKIE_FILE" "$BASE_URL" > /dev/null || return
-
-    # Clear link list?
-    if [ -n "$CLEAR" ]; then
-        log_debug 'Clearing remote upload link list.'
-
-        HTML=$(curl -b "$COOKIE_FILE" \
-            -H 'X-Requested-With: XMLHttpRequest' \
-            "$BASE_URL/remotedl/delCompleteDownload")
+    # Build upload request URL with required parameters
+    local REQUEST_URL="$BASE_URL/api/v2/file/upload?token=$TOKEN"
+    REQUEST_URL="${REQUEST_URL}&name=$(uri_encode_strict <<< "$DESTFILE")"
+    REQUEST_URL="${REQUEST_URL}&hash=$FILE_HASH"
+    REQUEST_URL="${REQUEST_URL}&size=$FILE_SIZE"
+    
+    # Add folder if specified
+    if [ -n "$FOLDER" ]; then
+        REQUEST_URL="${REQUEST_URL}&folder_id=$FOLDER"
     fi
 
-    # Prepare upload
-    if match_remote_url "$FILE"; then
-        URL="$BASE_URL/remotedl/index"
-    else
-        URL="$BASE_URL/site/index"
-    fi
+    # Request upload URL
+    log_debug "Requesting upload URL"
+    JSON=$(curl -s --fail "$REQUEST_URL") || return
+    log_debug "Upload request response: $JSON"
 
-    HTML=$(curl -b "$COOKIE_FILE" -c "$COOKIE_FILE" "$URL") || return
-
-    # Server sometimes returns an empty page
-    if [ -z "$HTML" ]; then
-        log_error 'Server sent empty page, maybe due to overload.'
-        return $ERR_LINK_TEMP_UNAVAILABLE
-    fi
-
-    # Upload remote file
-    if match_remote_url "$FILE"; then
-        local ACC_ID QUEUE TYPE TRY NUM REM_LINKS RL FILE_ID
-
-        # During synchronous remote uploads no other remote transfer
-        # must run (Note: This will ease parsing considerably later on.)
-        if [ -z "$ASYNC" ]; then
-            NUM=$(rapidgator_num_remote "$COOKIE_FILE" "$BASE_URL") || return
-            if [ $NUM -gt 0 ]; then
-                log_error 'You have active remote downloads.'
-                return $ERR_LINK_TEMP_UNAVAILABLE
-            fi
-        fi
-
-        # Scrape account details from site
-        ACC_ID=$(parse 'user_id =' 'id=\([[:digit:]]\+\)";' <<< "$HTML") || return
-        QUEUE=$(parse 'queue =' 'queue=\([^"]\+\)";' <<< "$HTML") || return
-
-        if match '^http://' "$FILE"; then
-            TYPE=$(parse_all_attr 'http://</option>' 'value' <<< "$HTML") || return
-        elif match '^ftp://' "$FILE"; then
-            TYPE=$(parse_all_attr 'ftp://</option>' 'value' <<< "$HTML") || return
-        else
-            log_error 'Unsupported protocol for remote upload.'
-            return $ERR_BAD_COMMAND_LINE
-        fi
-
-        log_debug "Queue: '$QUEUE'"
-        log_debug "Account ID: '$ACC_ID'"
-        log_debug "Upload type ID: '$TYPE'"
-
-        HTML=$(curl -b "$COOKIE_FILE" -F "my_select=$TYPE" \
-            -F 'login%5B2%5D=' -F 'password%5B2%5D=' \
-            -F 'login%5B3%5D=' -F 'password%5B3%5D=' \
-            -F 'login%5B4%5D=' -F 'password%5B4%5D=' \
-            -F 'login%5B6%5D=' -F 'password%5B6%5D=' \
-            -F 'login%5B8%5D=' -F 'password%5B8%5D=' \
-            -F 'login%5B9%5D=' -F 'password%5B9%5D=' \
-            -F 'login%5B10%5D=' -F 'password%5B10%5D=' \
-            -F 'login%5B11%5D=' -F 'password%5B11%5D=' \
-            -F "url=$FILE" \
-            -F "queue=$QUEUE" -F "user_id=$ACC_ID" \
-            -H 'X-Requested-With: XMLHttpRequest' \
-            "$BASE_URL/remotedl/Downloadrequest") || return
-
-        # Note: server *always* answers in russian
-        if ! match 'Файл добавлен в базу данных' "$HTML"; then
-            log_error 'Unexpected content. Site updated?'
-            return $ERR_FATAL
-        fi
-
-        # If this is an async upload, we are done
-        if [ -n "$ASYNC" ]; then
-            log_error 'Once remote upload completed, check your account for link.'
-            return $ERR_ASYNC_REQUEST
-        fi
-
-        # Keep checking progress
-        NUM=1
-        TRY=1
-        while [ $NUM -gt 0 ]; do
-            NUM=$(rapidgator_num_remote "$COOKIE_FILE" "$BASE_URL") || return
-
-            log_debug "Wait for server to download the file... [$((TRY++))]"
-            wait 15 || return # arbitrary, short wait time
-        done
-
-        # Upload done, find link
-        HTML=$(curl -b "$COOKIE_FILE" \
-            -H 'X-Requested-With: XMLHttpRequest' \
-            "$BASE_URL/remotedl/RefreshGridView?_=$(date +%s)000") || return
-
-        REM_LINKS=$(parse_all_tag tr <<< "$HTML") || return
-
-        while IFS= read -r RL; do
-            # Find the (first) line containing our URL
-            if match "$FILE" "$RL"; then
-                # Note: error is *always* in russian
-                if match 'Файл не доступен' "$RL"; then
-                    log_error 'Remote server cannot access file or refuses to download it.'
-                    return $ERR_FATAL
-                fi
-
-                FILE_ID=$(parse . 'getFileLink(\([[:digit:]]\+\),' <<< "$RL") || return
-                break
-            fi
-        done <<< "$REM_LINKS"
-
-        if [ -z "FILE_ID" ]; then
-            log_error 'Could not get file ID. Site updated?'
-            return $ERR_FATAL
-        fi
-
-        log_debug "File ID: '$FILE_ID'"
-
-        # Do we need to rename the file?
-        if [ "$DEST_FILE" != 'dummy' ]; then
-            log_debug 'Renaming file'
-
-            HTML=$(curl -b "$COOKIE_FILE" -F "id_rename=$FILE_ID" \
-                -F 'type_rename=file' -F "new_name=$DEST_FILE" \
-                -H 'X-Requested-With: XMLHttpRequest' \
-                "$BASE_URL/filesystem/RenameSelected") || return
-
-            match 'true' "$HTML" || \
-                log_error 'Could not rename file. Site updated?'
-        fi
-
-        LINK="$BASE_URL/file/$FILE_ID"
-
-    # Upload local file
-    else
-        local FOLDER_ID=0
-        local JSON SESSION_ID START_TIME STATE FOLDER_ID UP_URL PROG_URL
-
-        # If user choose a folder, check it now
-        if [ -n "$FOLDER" ]; then
-            FOLDER_ID=$(rapidgator_check_folder "$HTML" "$FOLDER") || return
-        fi
-
-        # Scrape URLs from site (upload server changes each time)
-        UP_URL=$(parse 'var form_url' 'setProtocol("\(.\+\)");' <<< "$HTML") || return
-        PROG_URL=$(parse 'var progress_url_srv' 'setProtocol("\(.\+\)");' <<< "$HTML") || return
-
-        log_debug "Upload URL: '$UP_URL'"
-        log_debug "Progress URL: '$PROG_URL'"
-        log_debug "Folder ID: '$FOLDER_ID'"
-
-        # Session ID is created this way (in uploadwidget.js):
-        #   var i, uuid = "";
-        #   for (i = 0; i < 32; i++) {
-        #       uuid += Math.floor(Math.random() * 16).toString(16);
-        #   }
-        SESSION_ID=$(random h 32)
-        START_TIME=$(date +%s)
-
-        # Upload file
-        HTML=$(curl_with_log --referer "$URL" -b "$COOKIE_FILE" \
-            -F "file=@$FILE;type=application/octet-stream;filename=$DEST_FILE" \
-            "$UP_URL$SESSION_ID&folder_id=$FOLDER_ID") || return
-
-        wait 5 || return
-
-        # Get download URL
-        JSON=$(curl --referer "$URL" -H "Origin: $BASE_URL" \
-            -H 'Accept: application/json, text/javascript, */*; q=0.01' \
-            "$PROG_URL&data%5B0%5D%5Buuid%5D=$SESSION_ID&data%5B0%5D%5Bstart_time%5D=$START_TIME") || return
-
-        # Check status
-        STATE=$(parse_json 'state' <<< "$JSON") || return
-        if [ "$STATE" != 'done' ]; then
-            log_error "Unexpected state: '$STATE'"
-            return $ERR_FATAL
-        fi
-
-        LINK=$(parse_json 'download_url' <<< "$JSON") || return
-        DEL_LINK=$(parse_json 'remove_url' <<< "$JSON") || return
-    fi
-
-    echo "$LINK"
-    echo "$DEL_LINK"
-}
-
-# Delete a file from Rapidgator
-# $1: cookie file
-# $2: rapidgator (delete) link
-rapidgator_delete() {
-    local -r COOKIE_FILE=$1
-    local -r URL=${2/#http:/https:}
-    local -r BASE_URL='https://rapidgator.net'
-    local HTML ID UP_ID
-
-    # Sanity checks
-    [ -n "$AUTH" ] || return $ERR_LINK_NEED_PERMISSIONS
-
-    # Login (don't care for account type)
-    rapidgator_login "$AUTH" "$COOKIE_FILE" "$BASE_URL" > /dev/null || return
-
-    ID=$(parse . '/id/\([^/]\+\)/up_id/' <<< "$URL") || return
-    UP_ID=$(parse . '/up_id/\(.\+\)$' <<< "$URL") || return
-
-    log_debug "ID: '$ID'"
-    log_debug "Up_ID: '$UP_ID'"
-
-    HTML=$(rapidgator_redir_curl "$URL" -b "$COOKIE_FILE" -b 'lang=en') || return
-
-    if match 'Do you really want to remove' "$HTML"; then
-        HTML=$(curl -b "$COOKIE_FILE" -d "id=$ID" -d "up_id=$UP_ID" \
-            "$BASE_URL/remove/remove") || return
-
-        if match 'File successfully deleted' "$HTML"; then
-            return 0
-        fi
-    elif match 'File not found' "$HTML"; then
-        return $ERR_LINK_DEAD
-    fi
-
-    log_error 'Unexpected content. Site updated?'
-    return $ERR_FATAL
-}
-
-# List a rapidgator.net shared file folder URL
-# $1: rapidgator.net link
-# $2: recurse subfolders (null string means not selected)
-# stdout: list of links
-rapidgator_list() {
-    local URL=$1
-    local PAGE LINKS NAMES
-
-    if ! match "${MODULE_RAPIDGATOR_REGEXP_URL}folder/" "$URL"; then
-        log_error 'This is not a directory list'
+    # Parse upload server response
+    if ! match '"status":200' "$JSON"; then
+        log_error "Failed to get upload URL: $JSON"
         return $ERR_FATAL
     fi
 
-    # No need for 'rapidgator_redir_curl' as we follow redirections anyway
-    PAGE=$(curl -L "$URL") || return
-    PAGE=$(parse_all_quiet '=.td-for-select' '\(<a href=.*\)$' <<< "$PAGE")
-    [ -z "$PAGE" ] && return $ERR_LINK_DEAD
+    # Check upload state
+    STATE=$(parse_json 'state' <<< "$JSON") || return
+    log_debug "Upload state: $STATE"
+    
+    # If state is 2 (Done), file already exists - instant upload
+    if [ "$STATE" = "2" ]; then
+        log_debug "File already exists on server (instant upload)"
+        # Extract URL using grep and sed
+        DOWNLOAD_URL=$(echo "$JSON" | grep -o '"url":"[^"]*"' | tail -1 | sed 's/"url":"\([^"]*\)"/\1/' | sed 's/\\//g')
+        if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
+            log_error "Failed to extract download URL from response"
+            return $ERR_FATAL
+        fi
+        echo "$DOWNLOAD_URL"
+        return 0
+    fi
+    
+    # If state is 0 (Uploading), we need to upload the file
+    if [ "$STATE" = "0" ]; then
+        UPLOAD_URL=$(parse_json 'url' <<< "$JSON") || return
+        UPLOAD_ID=$(parse_json 'upload_id' <<< "$JSON") || return
+        
+        log_debug "Upload URL: $UPLOAD_URL"
+        log_debug "Upload ID: $UPLOAD_ID"
 
-    NAMES=$(parse_all . 'alt=..>[[:space:]]*\([^<]*\)' <<< "$PAGE")
-    LINKS=$(parse_all_attr href <<< "$PAGE")
+        # Prepare multipart upload
+        local -a CURL_ARGS
+        CURL_ARGS=( \
+            -F "file=@$FILE" \
+        )
 
-    list_submit "$LINKS" "$NAMES" 'https://rapidgator.net' || return
+        # Perform file upload
+        log_debug "Uploading file: $DESTFILE"
+        JSON=$(curl --fail -s \
+            "${CURL_ARGS[@]}" \
+            "$UPLOAD_URL") || return
+        
+        log_debug "Upload response: $JSON"
+
+        # Check upload response
+        if match '"status":200' "$JSON"; then
+            STATE=$(parse_json 'state' <<< "$JSON") || STATE="1"
+            
+            # If state is 2 (Done), we're finished
+            if match '"state":2' "$JSON"; then
+                DOWNLOAD_URL=$(echo "$JSON" | grep -o '"url":"[^"]*"' | tail -1 | sed 's/"url":"\([^"]*\)"/\1/' | sed 's/\\//g')
+                if [ -n "$DOWNLOAD_URL" ] && [ "$DOWNLOAD_URL" != "null" ]; then
+                    log_debug "Upload successful"
+                    echo "$DOWNLOAD_URL"
+                    return 0
+                fi
+            fi
+            
+            # If state is 1 (Processing), wait and check status
+            if [ "$STATE" = "1" ] || match '"state":"1"' "$JSON"; then
+                log_debug "File is being processed, checking status..."
+                
+                # Wait for processing to complete (max 60 attempts, 5 seconds each = 5 minutes)
+                local ATTEMPTS=0
+                local MAX_ATTEMPTS=60
+                
+                while [ $ATTEMPTS -lt $MAX_ATTEMPTS ]; do
+                    sleep 5
+                    
+                    JSON=$(curl -s --fail \
+                        "$BASE_URL/api/v2/file/upload_info?token=$TOKEN&upload_id=$UPLOAD_ID") || return
+                    
+                    log_debug "Status check attempt $((ATTEMPTS+1)): $JSON"
+                    
+                    if match '"state":2' "$JSON"; then
+                        # Extract file URL from the nested structure
+                        local FILE_URL=$(echo "$JSON" | grep -o '"url":"[^"]*"' | tail -1 | sed 's/"url":"\([^"]*\)"/\1/' | sed 's/\\//g')
+                        
+                        if [ -n "$FILE_URL" ] && [ "$FILE_URL" != "null" ]; then
+                            log_debug "Upload completed successfully"
+                            echo "$FILE_URL"
+                            return 0
+                        else
+                            log_error "Failed to extract URL from upload response"
+                            return $ERR_FATAL
+                        fi
+                    fi
+                    
+                    # Check for failure state
+                    if match '"state":3' "$JSON"; then
+                        log_error "Upload failed on server side"
+                        return $ERR_FATAL
+                    fi
+                    
+                    ATTEMPTS=$((ATTEMPTS+1))
+                done
+                
+                log_error "Upload processing timeout"
+                return $ERR_FATAL
+            fi
+        else
+            log_error "Upload request failed"
+            return $ERR_FATAL
+        fi
+    fi
+
+    log_error "Upload failed"
+    return $ERR_FATAL
 }
 
 # Probe a download URL
 # $1: cookie file (unused here)
-# $2: rapidgator url
+# $2: Rapidgator url
 # $3: requested capability list
 # stdout: 1 capability per line
 rapidgator_probe() {
-    local -r URL=${2/#http:/https:}
+    local -r COOKIE_FILE=$1
+    local -r URL=$2
     local -r REQ_IN=$3
-    local PAGE REDIR REQ_OUT FILE_NAME FILE_SIZE
+    local FILE_ID JSON FILE_NAME FILE_SIZE
 
-    PAGE=$(rapidgator_redir_curl "$URL" --include -b 'lang=en') || return
-    REDIR=$(grep_http_header_location_quiet <<< "$PAGE")
+    # Extract file ID from URL
+    FILE_ID=$(parse . '/file/\([^/]*\)' <<< "$URL") || return
 
-    # Various "File not found" responses
-    if match 'Error 404' "$PAGE" || \
-        match 'File not found' "$PAGE" ||
-        [[ "$REDIR" = */article/premium ]]; then
+    # Use API to get file info (no auth required for basic info)
+    JSON=$(curl -s --fail \
+        "https://rapidgator.net/api/v2/file/info?file_id=$FILE_ID") || return
+
+    if ! match '"status":200' "$JSON"; then
         return $ERR_LINK_DEAD
     fi
 
     REQ_OUT=c
 
     if [[ $REQ_IN = *f* ]]; then
-        FILE_NAME=$(parse_tag title <<< "$PAGE")
-        FILE_NAME=${FILE_NAME#Download file }
-        test "$FILE_NAME" && echo "$FILE_NAME" && REQ_OUT="${REQ_OUT}f"
+        FILE_NAME=$(parse_json 'name' <<< "$JSON") && \
+            echo "$FILE_NAME" && REQ_OUT="${REQ_OUT}f"
     fi
 
     if [[ $REQ_IN = *s* ]]; then
-        FILE_SIZE=$(parse 'File size:' '<strong>\([^<]*\)' 1 <<< "$PAGE") && \
-            translate_size "$FILE_SIZE" && REQ_OUT="${REQ_OUT}s"
+        FILE_SIZE=$(parse_json 'size' <<< "$JSON") && \
+            echo "$FILE_SIZE" && REQ_OUT="${REQ_OUT}s"
     fi
 
     echo $REQ_OUT
